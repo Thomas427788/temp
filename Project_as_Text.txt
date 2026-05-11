@@ -1,0 +1,1032 @@
+hx711.c
+#include "hx711.h"
+#include "cmsis_os.h"
+
+void HX711_Init(void)
+{
+    // Enable GPIOD clock (already done in MX_GPIO_Init, but safe to repeat)
+    __HAL_RCC_GPIOD_CLK_ENABLE();
+
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    // CLK as output
+    GPIO_InitStruct.Pin   = HX711_CLK_PIN;
+    GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull  = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(HX711_CLK_PORT, &GPIO_InitStruct);
+
+    // DOUT as input
+    GPIO_InitStruct.Pin  = HX711_DOUT_PIN;
+    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    HAL_GPIO_Init(HX711_DOUT_PORT, &GPIO_InitStruct);
+
+    // CLK starts low
+    HAL_GPIO_WritePin(HX711_CLK_PORT, HX711_CLK_PIN, GPIO_PIN_RESET);
+}
+
+uint8_t HX711_IsReady(void)
+{
+    // DOUT low means data is ready
+    return (HAL_GPIO_ReadPin(HX711_DOUT_PORT, HX711_DOUT_PIN) == GPIO_PIN_RESET);
+}
+
+int32_t HX711_ReadRaw(void)
+{
+    uint32_t raw = 0;
+
+    // Wait until ready — yield to RTOS while waiting
+    while (!HX711_IsReady())
+        osDelay(1);
+
+    // Clock in 24 bits, MSB first
+    for (int i = 0; i < 24; i++)
+    {
+    	HAL_GPIO_WritePin(HX711_CLK_PORT, HX711_CLK_PIN, GPIO_PIN_SET);
+    	for (volatile int d = 0; d < 20; d++) __NOP();  // wait for DOUT to settle
+    	raw = (raw << 1) | HAL_GPIO_ReadPin(HX711_DOUT_PORT, HX711_DOUT_PIN);
+    	HAL_GPIO_WritePin(HX711_CLK_PORT, HX711_CLK_PIN, GPIO_PIN_RESET);
+    	for (volatile int d = 0; d < 20; d++) __NOP();
+    }
+
+    // 25th pulse — sets gain=128, channel A for next reading
+    HAL_GPIO_WritePin(HX711_CLK_PORT, HX711_CLK_PIN, GPIO_PIN_SET);
+    __NOP(); __NOP(); __NOP();
+    HAL_GPIO_WritePin(HX711_CLK_PORT, HX711_CLK_PIN, GPIO_PIN_RESET);
+    __NOP(); __NOP(); __NOP();
+
+    // Sign-extend from 24-bit two's complement to int32_t
+    if (raw & 0x800000)
+        raw |= 0xFF000000;
+
+    return (int32_t)raw;
+}
+
+load_cell_task.c
+#include "main.h"
+#include "cmsis_os.h"
+#include "hx711.h"
+#include <stdio.h>
+#include "shared_state.h"
+
+volatile uint8_t g_threshold_exceeded = 0;  // definition lives here
+
+void StartLoadCellTask(void *argument)
+{
+    HX711_Init();
+    osDelay(500); // Let HX711 settle after power-on
+
+    // ── Calibration ─────────────────────────────────────────────────────────
+    // We do a simple two-point calibration:
+    //   1. Tare  (zero load)   → zero_offset
+    //   2. Known weight        → scale_factor = (raw - zero_offset) / known_grams
+
+    int32_t zero_offset = 0;
+    float   scale_factor = 1.0f;  // raw counts per gram
+    float   known_weight_g = 0.0f;
+
+    // -- Step 1: Tare --
+    printf("=== Load Cell Calibration ===\r\n");
+    printf("Remove all weight from the load cell, then press Enter...\r\n");
+
+    // Wait for any character over USB CDC
+    // (Your __io_putchar already routes stdout to CDC;
+    //  for input you can poll CDC_Receive or use a simple flag —
+    //  here we just wait a fixed 5s so the user has time to remove weight)
+    osDelay(5000);
+
+    // Average 10 readings for a stable zero
+    int32_t sum = 0;
+    for (int i = 0; i < 10; i++) {
+        sum += HX711_ReadRaw();
+        osDelay(100);
+    }
+    zero_offset = sum / 10;
+    printf("Zero offset: %ld\r\n", zero_offset);
+
+    // -- Step 2: Known weight --
+    printf("Place a known weight on the load cell.\r\n");
+    printf("Enter the weight in grams as an integer (you have 10 seconds)...\r\n");
+    osDelay(10000); // Wait for weight to be placed
+
+    // Prompt user to hardcode known weight here if no CDC RX is set up.
+    // Replace 100.0f with whatever calibration weight you're using (in grams):
+    known_weight_g = 16.0f;  // <-- CHANGE THIS to your calibration weight
+
+    sum = 0;
+    for (int i = 0; i < 10; i++) {
+        sum += HX711_ReadRaw();
+        osDelay(100);
+    }
+    int32_t cal_raw = sum / 10;
+
+    if ((cal_raw - zero_offset) != 0)
+        scale_factor = (float)(cal_raw - zero_offset) / known_weight_g;
+    else
+        scale_factor = 1.0f; // avoid divide-by-zero; calibration failed
+
+    printf("Calibration done! Scale factor: %.2f counts/g\r\n", scale_factor);
+    printf("Starting measurements...\r\n\r\n");
+
+    // ── Measurement loop ────────────────────────────────────────────────────
+    for (;;)
+    {
+        int32_t raw = HX711_ReadRaw();
+        if (raw == INT32_MIN)
+        {
+            printf("Bad reading skipped\r\n");
+            osDelay(500);
+            continue;
+        }
+
+        float weight_g = (float)(raw - zero_offset) / scale_factor;
+        printf("Raw: %ld  |  Weight: %.2f g\r\n", raw, weight_g);
+
+        // Update shared flag for StepperTask
+        g_threshold_exceeded = (weight_g >= 1.0f) ? 1 : 0;
+
+        osDelay(500);
+    }
+}
+
+
+main.c
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include "cmsis_os.h"
+#include "usb_device.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+I2C_HandleTypeDef hi2c1;
+
+TIM_HandleTypeDef htim2;
+
+/* Definitions for defaultTask */
+osThreadId_t defaultTaskHandle;
+const osThreadAttr_t defaultTask_attributes = {
+  .name = "defaultTask",
+  .stack_size = 128 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
+/* Definitions for PrintTask */
+osThreadId_t PrintTaskHandle;
+const osThreadAttr_t PrintTask_attributes = {
+  .name = "PrintTask",
+  .stack_size = 256 * 4,
+  .priority = (osPriority_t) osPriorityLow,
+};
+/* Definitions for LoadCellTask */
+osThreadId_t LoadCellTaskHandle;
+const osThreadAttr_t LoadCellTask_attributes = {
+  .name = "LoadCellTask",
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityLow,
+};
+/* Definitions for StepperTask */
+osThreadId_t StepperTaskHandle;
+const osThreadAttr_t StepperTask_attributes = {
+  .name = "StepperTask",
+  .stack_size = 256 * 4,
+  .priority = (osPriority_t) osPriorityLow,
+};
+/* USER CODE BEGIN PV */
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_I2C1_Init(void);
+static void MX_TIM2_Init(void);
+void StartDefaultTask(void *argument);
+void StartPrintTask(void *argument);
+void StartLoadCellTask(void *argument);
+void StartStepperTask(void *argument);
+
+/* USER CODE BEGIN PFP */
+
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+#include <stdio.h>
+#include "usbd_cdc_if.h"
+
+int __io_putchar(int ch) {
+    uint8_t c = (uint8_t)ch;
+    while (CDC_Transmit_FS(&c, 1) == USBD_BUSY);
+    return ch;
+}
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_I2C1_Init();
+  MX_TIM2_Init();
+  /* USER CODE BEGIN 2 */
+  // Nothing needed here anymore - task handles everything
+  /* USER CODE END 2 */
+
+  /* Init scheduler */
+  osKernelInitialize();
+
+  /* USER CODE BEGIN RTOS_MUTEX */
+  /* add mutexes, ... */
+  /* USER CODE END RTOS_MUTEX */
+
+  /* USER CODE BEGIN RTOS_SEMAPHORES */
+  /* add semaphores, ... */
+  /* USER CODE END RTOS_SEMAPHORES */
+
+  /* USER CODE BEGIN RTOS_TIMERS */
+  /* start timers, add new ones, ... */
+  /* USER CODE END RTOS_TIMERS */
+
+  /* USER CODE BEGIN RTOS_QUEUES */
+  /* add queues, ... */
+  /* USER CODE END RTOS_QUEUES */
+
+  /* Create the thread(s) */
+  /* creation of defaultTask */
+  defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
+
+  /* creation of PrintTask */
+  PrintTaskHandle = osThreadNew(StartPrintTask, NULL, &PrintTask_attributes);
+
+  /* creation of LoadCellTask */
+  LoadCellTaskHandle = osThreadNew(StartLoadCellTask, NULL, &LoadCellTask_attributes);
+
+  /* creation of StepperTask */
+  StepperTaskHandle = osThreadNew(StartStepperTask, NULL, &StepperTask_attributes);
+
+  /* USER CODE BEGIN RTOS_THREADS */
+  /* add threads, ... */
+  /* USER CODE END RTOS_THREADS */
+
+  /* USER CODE BEGIN RTOS_EVENTS */
+  /* add events, ... */
+  /* USER CODE END RTOS_EVENTS */
+
+  /* Start scheduler */
+  osKernelStart();
+
+  /* We should never get here as control is now taken by the scheduler */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+  }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Configure the main internal regulator output voltage
+  */
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM = 8;
+  RCC_OscInitStruct.PLL.PLLN = 336;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ = 7;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief I2C1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2C1_Init(void)
+{
+
+  /* USER CODE BEGIN I2C1_Init 0 */
+
+  /* USER CODE END I2C1_Init 0 */
+
+  /* USER CODE BEGIN I2C1_Init 1 */
+
+  /* USER CODE END I2C1_Init 1 */
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.ClockSpeed = 100000;
+  hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
+  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C1_Init 2 */
+
+  /* USER CODE END I2C1_Init 2 */
+
+}
+
+/**
+  * @brief TIM2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM2_Init(void)
+{
+
+  /* USER CODE BEGIN TIM2_Init 0 */
+
+  /* USER CODE END TIM2_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM2_Init 1 */
+
+  /* USER CODE END TIM2_Init 1 */
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 167;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 65535;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM2_Init 2 */
+
+  /* USER CODE END TIM2_Init 2 */
+
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+
+  /* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOE_CLK_ENABLE();
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOH_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOD_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(CS_I2C_SPI_GPIO_Port, CS_I2C_SPI_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(OTG_FS_PowerSwitchOn_GPIO_Port, OTG_FS_PowerSwitchOn_Pin, GPIO_PIN_SET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOA, STEPPER_IN1_Pin|STEPPER_IN2_Pin|STEPPER_IN3_Pin|STEPPER_IN4_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOD, LD4_Pin|LD3_Pin|LD5_Pin|LD6_Pin
+                          |Audio_RST_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : CS_I2C_SPI_Pin */
+  GPIO_InitStruct.Pin = CS_I2C_SPI_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(CS_I2C_SPI_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : OTG_FS_PowerSwitchOn_Pin */
+  GPIO_InitStruct.Pin = OTG_FS_PowerSwitchOn_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(OTG_FS_PowerSwitchOn_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PDM_OUT_Pin */
+  GPIO_InitStruct.Pin = PDM_OUT_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  GPIO_InitStruct.Alternate = GPIO_AF5_SPI2;
+  HAL_GPIO_Init(PDM_OUT_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : B1_Pin */
+  GPIO_InitStruct.Pin = B1_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_EVT_RISING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : STEPPER_IN1_Pin STEPPER_IN2_Pin STEPPER_IN3_Pin STEPPER_IN4_Pin */
+  GPIO_InitStruct.Pin = STEPPER_IN1_Pin|STEPPER_IN2_Pin|STEPPER_IN3_Pin|STEPPER_IN4_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : SPI1_MISO_Pin SPI1_MOSI_Pin */
+  GPIO_InitStruct.Pin = SPI1_MISO_Pin|SPI1_MOSI_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  GPIO_InitStruct.Alternate = GPIO_AF5_SPI1;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : BOOT1_Pin */
+  GPIO_InitStruct.Pin = BOOT1_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(BOOT1_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : CLK_IN_Pin */
+  GPIO_InitStruct.Pin = CLK_IN_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  GPIO_InitStruct.Alternate = GPIO_AF5_SPI2;
+  HAL_GPIO_Init(CLK_IN_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : LD4_Pin LD3_Pin LD5_Pin LD6_Pin
+                           Audio_RST_Pin */
+  GPIO_InitStruct.Pin = LD4_Pin|LD3_Pin|LD5_Pin|LD6_Pin
+                          |Audio_RST_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : I2S3_MCK_Pin I2S3_SCK_Pin I2S3_SD_Pin */
+  GPIO_InitStruct.Pin = I2S3_MCK_Pin|I2S3_SCK_Pin|I2S3_SD_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  GPIO_InitStruct.Alternate = GPIO_AF6_SPI3;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : OTG_FS_OverCurrent_Pin */
+  GPIO_InitStruct.Pin = OTG_FS_OverCurrent_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(OTG_FS_OverCurrent_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : MEMS_INT2_Pin */
+  GPIO_InitStruct.Pin = MEMS_INT2_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_EVT_RISING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(MEMS_INT2_GPIO_Port, &GPIO_InitStruct);
+
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+
+  /* USER CODE END MX_GPIO_Init_2 */
+}
+
+/* USER CODE BEGIN 4 */
+
+/* USER CODE END 4 */
+
+/* USER CODE BEGIN Header_StartDefaultTask */
+/**
+  * @brief  Function implementing the defaultTask thread.
+  * @param  argument: Not used
+  * @retval None
+  */
+/* USER CODE END Header_StartDefaultTask */
+void StartDefaultTask(void *argument)
+{
+  /* init code for USB_DEVICE */
+  MX_USB_DEVICE_Init();
+  /* USER CODE BEGIN 5 */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END 5 */
+}
+
+/* USER CODE BEGIN Header_StartPrintTask */
+/**
+* @brief Function implementing the PrintTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartPrintTask */
+__weak void StartPrintTask(void *argument)
+{
+  /* USER CODE BEGIN StartPrintTask */
+
+  // Wait for USB CDC to enumerate
+  osDelay(1000);
+
+  #if 0
+	  printf("FreeRTOS + USB CDC ready!\r\n");
+
+	  for (;;)
+	  {
+		printf("Hello from FreeRTOS! Tick: %lu\r\n", osKernelGetTickCount());
+		osDelay(1000); // Always use osDelay in FreeRTOS tasks, never HAL_Delay
+	  }
+  #endif
+
+  for (;;)
+  {
+    osDelay(1000);
+  }
+  /* USER CODE END StartPrintTask */
+}
+
+/* USER CODE BEGIN Header_StartLoadCellTask */
+/**
+* @brief Function implementing the LoadCellTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartLoadCellTask */
+__weak void StartLoadCellTask(void *argument)
+{
+  /* USER CODE BEGIN StartLoadCellTask */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END StartLoadCellTask */
+}
+
+/* USER CODE BEGIN Header_StartStepperTask */
+/**
+* @brief Function implementing the StepperTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartStepperTask */
+__weak void StartStepperTask(void *argument)
+{
+  /* USER CODE BEGIN StartStepperTask */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END StartStepperTask */
+}
+
+/**
+  * @brief  Period elapsed callback in non blocking mode
+  * @note   This function is called  when TIM1 interrupt took place, inside
+  * HAL_TIM_IRQHandler(). It makes a direct call to HAL_IncTick() to increment
+  * a global variable "uwTick" used as application time base.
+  * @param  htim : TIM handle
+  * @retval None
+  */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  /* USER CODE BEGIN Callback 0 */
+
+  /* USER CODE END Callback 0 */
+  if (htim->Instance == TIM1)
+  {
+    HAL_IncTick();
+  }
+  /* USER CODE BEGIN Callback 1 */
+
+  /* USER CODE END Callback 1 */
+}
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+#ifdef USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */
+
+
+stepper_task.c
+#include "main.h"
+#include "cmsis_os.h"
+#include "stepper.h"
+#include "shared_state.h"
+
+void StartStepperTask(void *argument)
+{
+    Stepper_Init();
+
+    for (;;)
+    {
+        if (g_threshold_exceeded)
+        {
+            // Forward — small burst then re-check so we're responsive
+            Stepper_Step(256, 1000, 1);
+        }
+        else
+        {
+            // Reverse
+            Stepper_Step(256, 1000, -1);
+        }
+        // No osDelay needed — Stepper_Step itself takes time via microDelay.
+        // The 256-step burst at 1000us/step = ~256ms per loop iteration.
+    }
+}
+
+stepper.c
+#include "stepper.h"
+
+// PA1, PA3, PA4, PA5 — matching your stepper project exactly
+#define IN1_PIN   GPIO_PIN_1
+#define IN1_PORT  GPIOA
+#define IN2_PIN   GPIO_PIN_3
+#define IN2_PORT  GPIOA
+#define IN3_PIN   GPIO_PIN_4
+#define IN3_PORT  GPIOA
+#define IN4_PIN   GPIO_PIN_5
+#define IN4_PORT  GPIOA
+
+// TIM1 handle is defined in main.c, declared extern here
+extern TIM_HandleTypeDef htim2;
+
+static const uint8_t step_sequence[8][4] = {
+    {1, 0, 0, 0},
+    {1, 1, 0, 0},
+    {0, 1, 0, 0},
+    {0, 1, 1, 0},
+    {0, 0, 1, 0},
+    {0, 0, 1, 1},
+    {0, 0, 0, 1},
+    {1, 0, 0, 1}
+};
+
+static void microDelay(uint16_t delay)
+{
+    __HAL_TIM_SET_COUNTER(&htim2, 0);
+    while (__HAL_TIM_GET_COUNTER(&htim2) < delay);
+}
+
+static void setPins(uint8_t step[4])
+{
+    HAL_GPIO_WritePin(IN1_PORT, IN1_PIN, step[0] ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(IN2_PORT, IN2_PIN, step[1] ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(IN3_PORT, IN3_PIN, step[2] ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(IN4_PORT, IN4_PIN, step[3] ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+
+void Stepper_Init(void)
+{
+    // GPIO already initialized by MX_GPIO_Init — just start TIM2
+    HAL_TIM_Base_Start(&htim2);
+}
+
+void Stepper_Step(int steps, uint16_t delay_us, int direction)
+{
+    int seq_len = sizeof(step_sequence) / sizeof(step_sequence[0]);
+    for (int x = 0; x < steps; x++)
+    {
+        int idx = (direction == 1)
+                  ? (x % seq_len)
+                  : ((seq_len - (x % seq_len)) % seq_len);
+        setPins((uint8_t*)step_sequence[idx]);
+        microDelay(delay_us);
+    }
+}
+
+
+hx711.h
+#ifndef HX711_H
+#define HX711_H
+
+#include "main.h"
+#include <stdint.h>
+
+// PD0 = CLK, PD1 = DOUT
+#define HX711_CLK_PIN   GPIO_PIN_0
+#define HX711_CLK_PORT  GPIOD
+#define HX711_DOUT_PIN  GPIO_PIN_1
+#define HX711_DOUT_PORT GPIOD
+
+void     HX711_Init(void);
+int32_t  HX711_ReadRaw(void);
+uint8_t  HX711_IsReady(void);
+
+#endif
+
+load_cell_task.h
+#ifndef LOAD_CELL_TASK_H
+#define LOAD_CELL_TASK_H
+
+void StartLoadCellTask(void *argument);
+
+#endif /* LOAD_CELL_TASK_H */
+
+main.h
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.h
+  * @brief          : Header for main.c file.
+  *                   This file contains the common defines of the application.
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+
+/* Define to prevent recursive inclusion -------------------------------------*/
+#ifndef __MAIN_H
+#define __MAIN_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Includes ------------------------------------------------------------------*/
+#include "stm32f4xx_hal.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+
+/* USER CODE END Includes */
+
+/* Exported types ------------------------------------------------------------*/
+/* USER CODE BEGIN ET */
+
+/* USER CODE END ET */
+
+/* Exported constants --------------------------------------------------------*/
+/* USER CODE BEGIN EC */
+
+/* USER CODE END EC */
+
+/* Exported macro ------------------------------------------------------------*/
+/* USER CODE BEGIN EM */
+
+/* USER CODE END EM */
+
+/* Exported functions prototypes ---------------------------------------------*/
+void Error_Handler(void);
+
+/* USER CODE BEGIN EFP */
+
+/* USER CODE END EFP */
+
+/* Private defines -----------------------------------------------------------*/
+#define CS_I2C_SPI_Pin GPIO_PIN_3
+#define CS_I2C_SPI_GPIO_Port GPIOE
+#define PC14_OSC32_IN_Pin GPIO_PIN_14
+#define PC14_OSC32_IN_GPIO_Port GPIOC
+#define PC15_OSC32_OUT_Pin GPIO_PIN_15
+#define PC15_OSC32_OUT_GPIO_Port GPIOC
+#define PH0_OSC_IN_Pin GPIO_PIN_0
+#define PH0_OSC_IN_GPIO_Port GPIOH
+#define PH1_OSC_OUT_Pin GPIO_PIN_1
+#define PH1_OSC_OUT_GPIO_Port GPIOH
+#define OTG_FS_PowerSwitchOn_Pin GPIO_PIN_0
+#define OTG_FS_PowerSwitchOn_GPIO_Port GPIOC
+#define PDM_OUT_Pin GPIO_PIN_3
+#define PDM_OUT_GPIO_Port GPIOC
+#define B1_Pin GPIO_PIN_0
+#define B1_GPIO_Port GPIOA
+#define STEPPER_IN1_Pin GPIO_PIN_1
+#define STEPPER_IN1_GPIO_Port GPIOA
+#define STEPPER_IN2_Pin GPIO_PIN_3
+#define STEPPER_IN2_GPIO_Port GPIOA
+#define STEPPER_IN3_Pin GPIO_PIN_4
+#define STEPPER_IN3_GPIO_Port GPIOA
+#define STEPPER_IN4_Pin GPIO_PIN_5
+#define STEPPER_IN4_GPIO_Port GPIOA
+#define SPI1_MISO_Pin GPIO_PIN_6
+#define SPI1_MISO_GPIO_Port GPIOA
+#define SPI1_MOSI_Pin GPIO_PIN_7
+#define SPI1_MOSI_GPIO_Port GPIOA
+#define BOOT1_Pin GPIO_PIN_2
+#define BOOT1_GPIO_Port GPIOB
+#define CLK_IN_Pin GPIO_PIN_10
+#define CLK_IN_GPIO_Port GPIOB
+#define LD4_Pin GPIO_PIN_12
+#define LD4_GPIO_Port GPIOD
+#define LD3_Pin GPIO_PIN_13
+#define LD3_GPIO_Port GPIOD
+#define LD5_Pin GPIO_PIN_14
+#define LD5_GPIO_Port GPIOD
+#define LD6_Pin GPIO_PIN_15
+#define LD6_GPIO_Port GPIOD
+#define I2S3_MCK_Pin GPIO_PIN_7
+#define I2S3_MCK_GPIO_Port GPIOC
+#define VBUS_FS_Pin GPIO_PIN_9
+#define VBUS_FS_GPIO_Port GPIOA
+#define OTG_FS_ID_Pin GPIO_PIN_10
+#define OTG_FS_ID_GPIO_Port GPIOA
+#define OTG_FS_DM_Pin GPIO_PIN_11
+#define OTG_FS_DM_GPIO_Port GPIOA
+#define OTG_FS_DP_Pin GPIO_PIN_12
+#define OTG_FS_DP_GPIO_Port GPIOA
+#define SWDIO_Pin GPIO_PIN_13
+#define SWDIO_GPIO_Port GPIOA
+#define SWCLK_Pin GPIO_PIN_14
+#define SWCLK_GPIO_Port GPIOA
+#define I2S3_SCK_Pin GPIO_PIN_10
+#define I2S3_SCK_GPIO_Port GPIOC
+#define I2S3_SD_Pin GPIO_PIN_12
+#define I2S3_SD_GPIO_Port GPIOC
+#define Audio_RST_Pin GPIO_PIN_4
+#define Audio_RST_GPIO_Port GPIOD
+#define OTG_FS_OverCurrent_Pin GPIO_PIN_5
+#define OTG_FS_OverCurrent_GPIO_Port GPIOD
+#define SWO_Pin GPIO_PIN_3
+#define SWO_GPIO_Port GPIOB
+#define Audio_SCL_Pin GPIO_PIN_6
+#define Audio_SCL_GPIO_Port GPIOB
+#define Audio_SDA_Pin GPIO_PIN_9
+#define Audio_SDA_GPIO_Port GPIOB
+#define MEMS_INT2_Pin GPIO_PIN_1
+#define MEMS_INT2_GPIO_Port GPIOE
+
+/* USER CODE BEGIN Private defines */
+
+/* USER CODE END Private defines */
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* __MAIN_H */
+
+
+shared_state.h
+#ifndef SHARED_STATE_H
+#define SHARED_STATE_H
+
+#include <stdint.h>
+
+// 0 = below threshold (forward), 1 = at/above threshold (reverse)
+extern volatile uint8_t g_threshold_exceeded;
+
+#endif
+
+
+stepper_task.h
+#ifndef STEPPER_TASK_H
+#define STEPPER_TASK_H
+
+void StartStepperTask(void *argument);
+
+#endif
+
+stepper.h
+#ifndef STEPPER_H
+#define STEPPER_H
+
+#include "main.h"
+#include <stdint.h>
+
+void Stepper_Init(void);
+void Stepper_Step(int steps, uint16_t delay_us, int direction);
+
+#endif
