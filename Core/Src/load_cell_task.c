@@ -126,7 +126,7 @@ void StartLoadCellTask(void *argument)
             uint32_t now = osKernelGetTickCount();
             if (now - last_print_ms >= 1000)
             {
-                printf("Raw: %ld  |  Pressure: %.4f PSI\r\n", raw, pressure_psi);
+                printf("PRESSURE:%.2f PSI\r\n", pressure_psi);
                 last_print_ms = now;
             }
 
